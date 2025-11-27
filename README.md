@@ -50,7 +50,7 @@ State-of-the-art performance on **CelebA** and **MultiNLI** datasets.
 
 ### Installation
 ```bash
-git clone [https://github.com/SongqiZhou/FairNet.git](https://github.com/SongqiZhou/FairNet.git)
+git clone https://github.com/SongqiZhou/FairNet.git
 cd FairNet
 pip install -r requirements.txt
 ```
