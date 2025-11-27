@@ -48,7 +48,7 @@ State-of-the-art performance on **CelebA** and **MultiNLI** datasets.
 
 ## 🚀 Quick Start
 
-### Installation
+### Installation  （It will be online soon）
 ```bash
 git clone https://github.com/SongqiZhou/FairNet.git
 cd FairNet
