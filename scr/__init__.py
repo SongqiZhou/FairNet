@@ -1,83 +1,22 @@
-"""
-FairNet: Dynamic Fairness Correction without Performance Loss via Contrastive Conditional LoRA
+"""Backward-compatible alias for the historical, misspelled ``scr`` package."""
 
-Paper: arXiv:2510.19421v1 [cs.LG] 22 Oct 2025
+from __future__ import annotations
 
-This package implements FairNet with support for:
-- Full: All sensitive attribute labels available
-- Partial: Only k% of sensitive attribute labels available  
-- Unlabeled: No sensitive attribute labels (uses unsupervised detection)
-"""
+import sys
+import warnings
 
-from .config import FairNetConfig, AttributeMode, ViTFairNetConfig, BERTFairNetConfig
-from .modules import (
-    AttentionPooling,
-    BiasDetector,
-    LoRALinear,
-    LoRAInjector,
-    TripletContrastiveLoss,
-    StaticPrototypeBank,
-    UnsupervisedBiasDetector,
-)
-from .models import FairNetViT, FairNetBERT
-from .trainers import (
-    FairNetTrainer,
-    FairNetPartialTrainer,
-    FairNetUnlabeledTrainer,
-)
-from .utils import (
-    seed_everything, 
-    evaluate_model, 
-    print_metrics,
-    save_checkpoint,
-    load_checkpoint,
-    compute_class_weights,
-    get_group_indices,
-)
-from .datasets import (
-    CelebADataset,
-    UTKFaceDataset,
-    SyntheticBiasedDataset,
-    create_celeba_loaders,
-    create_synthetic_loaders,
+import fairnet as _fairnet
+from fairnet import *  # noqa: F403
+from fairnet import config, datasets, models, modules, trainers, utils
+
+warnings.warn(
+    "The 'scr' package name is deprecated; import from 'fairnet' instead.",
+    DeprecationWarning,
+    stacklevel=2,
 )
 
-__version__ = "1.0.0"
-__author__ = "FairNet Implementation"
+for _module in (config, datasets, models, modules, trainers, utils):
+    sys.modules[f"{__name__}.{_module.__name__.rsplit('.', 1)[-1]}"] = _module
 
-__all__ = [
-    # Config
-    "FairNetConfig",
-    "AttributeMode",
-    "ViTFairNetConfig",
-    "BERTFairNetConfig",
-    # Modules
-    "AttentionPooling",
-    "BiasDetector", 
-    "LoRALinear",
-    "LoRAInjector",
-    "TripletContrastiveLoss",
-    "StaticPrototypeBank",
-    "UnsupervisedBiasDetector",
-    # Models
-    "FairNetViT",
-    "FairNetBERT",
-    # Trainers
-    "FairNetTrainer",
-    "FairNetPartialTrainer",
-    "FairNetUnlabeledTrainer",
-    # Utils
-    "seed_everything",
-    "evaluate_model",
-    "print_metrics",
-    "save_checkpoint",
-    "load_checkpoint",
-    "compute_class_weights",
-    "get_group_indices",
-    # Datasets
-    "CelebADataset",
-    "UTKFaceDataset",
-    "SyntheticBiasedDataset",
-    "create_celeba_loaders",
-    "create_synthetic_loaders",
-]
+__all__ = _fairnet.__all__
+__version__ = _fairnet.__version__
