@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use FairNet, please cite the NeurIPS 2025 paper."
+title: "FairNet"
+type: software
+version: 1.1.0
+authors:
+  - family-names: Zhou
+    given-names: Songqi
+  - family-names: Liu
+    given-names: Zeyuan
+  - family-names: Jiang
+    given-names: Benben
+repository-code: "https://github.com/SongqiZhou/FairNet"
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: "FairNet: Dynamic Fairness Correction without Performance Loss via Contrastive Conditional LoRA"
+  authors:
+    - family-names: Zhou
+      given-names: Songqi
+    - family-names: Liu
+      given-names: Zeyuan
+    - family-names: Jiang
+      given-names: Benben
+  collection-title: "Advances in Neural Information Processing Systems"
+  volume: "38, Main Conference"
+  pages: 90081-90114
+  publisher:
+    name: "Curran Associates, Inc."
+  year: 2025
+  doi: "10.52202/085713-3013"
