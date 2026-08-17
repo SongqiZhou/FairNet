@@ -37,17 +37,52 @@ def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+#: Worst-group accuracy over the ``(task label, sensitive group)`` cells. This
+#: is the convention used by GroupDRO, JTT, DFR, Sebra and D3M, and it is the
+#: one the paper's Table 1 numbers follow.
+WGA_LABEL_BY_GROUP = "label_by_group"
+
+#: Worst-group accuracy over the sensitive groups alone, which is the formula
+#: written in Supplementary C.4.
+WGA_SENSITIVE_GROUP = "sensitive_group"
+
+
 def compute_fairness_metrics(
     labels: Sequence[int] | np.ndarray,
     predictions: Sequence[int] | np.ndarray,
     sensitive: Sequence[int] | np.ndarray,
-) -> dict[str, float]:
+    wga_definition: str = WGA_LABEL_BY_GROUP,
+) -> dict[str, Any]:
     """Compute the paper's ACC, WGA, EOD, and supporting diagnostics.
 
-    WGA follows Appendix C.4: it is the minimum accuracy over sensitive groups,
-    not the minimum over label-by-group cells. For multiclass tasks, EOD and EOp
-    are macro averages of one-vs-rest group disparities.
+    **On the two WGA definitions.** Supplementary C.4 writes
+    ``WGA = min(P(Y_hat = Y | S = 0), P(Y_hat = Y | S = 1))``, a minimum over the
+    two sensitive groups. The numbers actually reported in Table 1 follow the
+    other, far more common convention: the minimum over the
+    ``(task label, sensitive group)`` cells. Two independent checks confirm it.
+
+    * On CelebA the sensitive groups are "blond" (29,983 images, of which only
+      1,749 are male) and "not blond". A model that simply predicted "not male"
+      for every blond image would already score 94.2% on the blond group, so the
+      reported ERM WGA of 77.9% cannot be a minimum over sensitive groups. It is
+      consistent with the accuracy on the small blond-and-male cell.
+    * On MultiNLI the reported ERM pair (ACC 82.6, WGA 67.3) matches the
+      standard six-cell worst-group accuracy of Sagawa et al. for this dataset.
+
+    Both quantities are always returned. ``worst_group_accuracy`` follows
+    ``wga_definition`` and defaults to the Table 1 convention, so reproduction
+    numbers are comparable with the paper and its baselines;
+    ``worst_sensitive_group_accuracy`` and ``worst_label_group_cell_accuracy``
+    are always available under their own explicit names.
+
+    For multiclass tasks, EOD and EOp are macro averages of one-vs-rest group
+    disparities.
     """
+
+    if wga_definition not in {WGA_LABEL_BY_GROUP, WGA_SENSITIVE_GROUP}:
+        raise ValueError(
+            f"wga_definition must be {WGA_LABEL_BY_GROUP!r} or {WGA_SENSITIVE_GROUP!r}"
+        )
 
     labels = np.asarray(labels).reshape(-1)
     predictions = np.asarray(predictions).reshape(-1)
@@ -57,27 +92,34 @@ def compute_fairness_metrics(
     if len(labels) == 0:
         raise ValueError("Fairness metrics require at least one sample")
 
-    metrics: dict[str, float] = {"accuracy": float(accuracy_score(labels, predictions))}
+    metrics: dict[str, Any] = {"accuracy": float(accuracy_score(labels, predictions))}
     task_classes = np.unique(labels)
     groups = np.unique(sensitive)
 
     group_accuracies = []
+    cell_accuracies = []
     for group in groups:
         group_mask = sensitive == group
         group_accuracy = float((predictions[group_mask] == labels[group_mask]).mean())
         metrics[f"acc_group_{int(group)}"] = group_accuracy
         group_accuracies.append(group_accuracy)
 
-        # These intersection diagnostics are useful for debugging but do not
-        # enter the paper's WGA definition.
         for task_class in task_classes:
             cell = group_mask & (labels == task_class)
             if cell.any():
-                metrics[f"acc_group_{int(group)}_{int(task_class)}"] = float(
-                    (predictions[cell] == labels[cell]).mean()
-                )
+                cell_accuracy = float((predictions[cell] == labels[cell]).mean())
+                metrics[f"acc_group_{int(group)}_{int(task_class)}"] = cell_accuracy
+                metrics[f"count_group_{int(group)}_{int(task_class)}"] = int(cell.sum())
+                cell_accuracies.append(cell_accuracy)
 
-    metrics["worst_group_accuracy"] = min(group_accuracies)
+    metrics["worst_sensitive_group_accuracy"] = min(group_accuracies)
+    metrics["worst_label_group_cell_accuracy"] = min(cell_accuracies)
+    metrics["worst_group_accuracy"] = (
+        metrics["worst_label_group_cell_accuracy"]
+        if wga_definition == WGA_LABEL_BY_GROUP
+        else metrics["worst_sensitive_group_accuracy"]
+    )
+    metrics["wga_definition"] = wga_definition
     metrics["accuracy_gap"] = max(group_accuracies) - min(group_accuracies)
 
     equalized_odds = []
@@ -230,7 +272,12 @@ def evaluate_model(
                 sensitive_all[attr].extend(sensitive[attr].cpu().numpy().reshape(-1))
 
     per_attribute = {
-        attr: compute_fairness_metrics(labels_all, predictions_all, sensitive_all[attr])
+        attr: compute_fairness_metrics(
+            labels_all,
+            predictions_all,
+            sensitive_all[attr],
+            wga_definition=config.wga_definition,
+        )
         for attr in config.sensitive_attributes
     }
     primary = config.sensitive_attributes[0]
@@ -250,6 +297,107 @@ def evaluate_model(
     return metrics
 
 
+def set_activation_threshold(model: nn.Module, config: FairNetConfig, threshold: float) -> None:
+    """Retune the conditional-LoRA activation threshold tau in place.
+
+    Supplementary C.3.1 selects tau on a validation grid search (typical values
+    0.5-0.8), so the threshold has to be adjustable after training without
+    rebuilding the model. Both the config and every injected ``LoRALinear`` are
+    updated so gating and reporting stay in sync.
+    """
+
+    if not 0 <= threshold <= 1:
+        raise ValueError("threshold must be in [0, 1]")
+    config.activation_threshold = threshold
+    for lora in model.lora_modules.values():
+        lora.threshold = threshold
+
+
+def evaluate_detector(
+    model: nn.Module,
+    loader: DataLoader,
+    config: FairNetConfig,
+    device: torch.device,
+    attribute: int | None = None,
+) -> dict[str, float]:
+    """Measure the bias detector's TPR/FPR on the minority group.
+
+    These are the quantities Condition 8 of the paper depends on and the ones
+    reported in Supplementary Tables 5, B, H, and I.
+    """
+
+    attribute = config.sensitive_attributes[0] if attribute is None else attribute
+    if attribute not in config.sensitive_attributes:
+        raise ValueError(f"{attribute} is not a configured sensitive attribute")
+
+    model.eval()
+    scores_all: list[float] = []
+    targets_all: list[int] = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Scoring detector"):
+            inputs, _, sensitive = _unpack_evaluation_batch(batch, config, device)
+            if isinstance(inputs, Mapping):
+                hidden = model.get_intermediate_features(**inputs)
+                mask = inputs.get("attention_mask")
+            else:
+                hidden = model.get_intermediate_features(inputs)
+                mask = None
+            detector = model.bias_detectors[f"detector_{attribute}"]
+            scores = detector(hidden, is_sequence=True, attention_mask=mask)
+            scores_all.extend(scores.cpu().numpy().reshape(-1).tolist())
+            targets_all.extend(sensitive[attribute].cpu().numpy().reshape(-1).tolist())
+
+    scores = np.asarray(scores_all)
+    targets = np.asarray(targets_all)
+    fired = scores > config.activation_threshold
+    minority = targets == 1
+    majority = targets == 0
+    tpr = float(fired[minority].mean()) if minority.any() else float("nan")
+    fpr = float(fired[majority].mean()) if majority.any() else float("nan")
+    return {
+        "TPR": tpr,
+        "FPR": fpr,
+        "TPR_FPR_ratio": float(tpr / fpr) if fpr > 0 else float("inf"),
+        "minority_prevalence": float(minority.mean()),
+    }
+
+
+def sweep_activation_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    config: FairNetConfig,
+    device: torch.device,
+    thresholds: Sequence[float] = (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0),
+) -> list[dict[str, Any]]:
+    """Reproduce the Supplementary Table I threshold ablation.
+
+    Runs :func:`evaluate_model` once per threshold and restores the original
+    threshold afterwards. Detector rates are included whenever a learned
+    detector gates the correction; FairNet-Full gates on ground-truth labels and
+    therefore has no detector rates to report.
+    """
+
+    original = config.activation_threshold
+    rows: list[dict[str, Any]] = []
+    try:
+        for threshold in thresholds:
+            set_activation_threshold(model, config, threshold)
+            metrics = evaluate_model(model, loader, config, device, use_lora=True)
+            row: dict[str, Any] = {
+                "threshold": float(threshold),
+                "ACC": metrics["accuracy"],
+                "WGA": metrics["worst_group_accuracy"],
+                "EOD": metrics["EOD"],
+                "lora_activation_rate": metrics.get("lora_activation_rate"),
+            }
+            if config.attribute_mode != AttributeMode.FULL:
+                row.update(evaluate_detector(model, loader, config, device))
+            rows.append(row)
+    finally:
+        set_activation_threshold(model, config, original)
+    return rows
+
+
 def print_metrics(metrics: Mapping[str, Any], title: str = "Evaluation Results") -> None:
     """Print the primary paper metrics and available group diagnostics."""
 
@@ -264,6 +412,27 @@ def print_metrics(metrics: Mapping[str, Any], title: str = "Evaluation Results")
     print(f"Demographic parity:    {metrics.get('DP', 0):.4f}")
     if "lora_activation_rate" in metrics:
         print(f"LoRA activation rate:  {metrics['lora_activation_rate']:.4f}")
+
+
+def summarize_metrics(runs: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> dict[str, Any]:
+    """Aggregate repeated runs into ``mean`` and ``std`` per metric.
+
+    The paper reports mean +- standard deviation over repeated runs (NeurIPS
+    checklist item 7), so multi-seed reproduction results are summarised the
+    same way.
+    """
+
+    if not runs:
+        raise ValueError("summarize_metrics requires at least one run")
+    summary: dict[str, Any] = {"num_runs": len(runs)}
+    for key in keys:
+        values = np.asarray([float(run[key]) for run in runs], dtype=float)
+        summary[key] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+            "values": values.tolist(),
+        }
+    return summary
 
 
 def compute_class_weights(
@@ -336,5 +505,15 @@ def load_checkpoint(model: nn.Module, path: str | Path, device: torch.device) ->
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     except TypeError:  # PyTorch versions before ``weights_only`` was added.
         checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as error:
+        saved = checkpoint.get("config", {})
+        raise RuntimeError(
+            f"{checkpoint_path} does not match this model. A checkpoint stores one "
+            "specific LoRA placement, so it can only be loaded into a model built "
+            "with the same lora_layers and lora_target_modules. Saved config used "
+            f"lora_layers={saved.get('lora_layers')} and "
+            f"lora_target_modules={saved.get('lora_target_modules')}."
+        ) from error
     return dict(checkpoint.get("metrics", {}))

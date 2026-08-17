@@ -355,6 +355,7 @@ class FairNetBERT(nn.Module):
         super().__init__()
         if num_classes <= 0:
             raise ValueError("num_classes must be positive")
+        self.accepts_token_type_ids = self._accepts_token_type_ids()
         self.config = config
         self.num_classes = num_classes
 
@@ -363,9 +364,9 @@ class FairNetBERT(nn.Module):
         if bert_model is not None:
             self.bert = bert_model
         elif bert_config is not None:
-            self.bert = BertModel(bert_config)
+            self.bert = self._backbone_class()(bert_config)
         else:
-            self.bert = BertModel.from_pretrained(model_name)
+            self.bert = self._backbone_class().from_pretrained(model_name)
         self.hidden_dim = self.bert.config.hidden_size
         if config.hidden_dim != self.hidden_dim:
             raise ValueError(
@@ -394,7 +395,10 @@ class FairNetBERT(nn.Module):
             adapter_names=[str(attr) for attr in config.sensitive_attributes],
         )
 
-        print(f"Injected LoRA into {len(self.lora_modules)} BERT modules")
+        print(
+            f"Injected LoRA into {len(self.lora_modules)} "
+            f"{type(self.bert).__name__} modules"
+        )
 
         # Bias detectors
         self.bias_detectors = nn.ModuleDict(
@@ -421,6 +425,21 @@ class FairNetBERT(nn.Module):
         if num_classes == 1:
             classifier_layers.append(nn.Sigmoid())
         self.classifier = nn.Sequential(*classifier_layers)
+
+    @staticmethod
+    def _backbone_class():
+        return BertModel
+
+    @staticmethod
+    def _accepts_token_type_ids() -> bool:
+        return True
+
+    def _encoder_kwargs(self, token_type_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
+        """Extra keyword arguments for the backbone's forward pass."""
+
+        if self.accepts_token_type_ids:
+            return {"token_type_ids": token_type_ids}
+        return {}
 
     def freeze_base(self):
         for name, p in self.bert.named_parameters():
@@ -490,9 +509,9 @@ class FairNetBERT(nn.Module):
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             output_hidden_states=True,
             return_dict=True,
+            **self._encoder_kwargs(token_type_ids),
         )
         return outputs.hidden_states[layer_idx + 1]
 
@@ -508,7 +527,7 @@ class FairNetBERT(nn.Module):
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
+            **self._encoder_kwargs(token_type_ids),
         )
         return outputs.last_hidden_state[:, 0]
 
@@ -604,3 +623,42 @@ class FairNetBERT(nn.Module):
         elif return_features:
             return logits, corrected_features
         return logits
+
+
+class FairNetDistilBERT(FairNetBERT):
+    """FairNet with a DistilBERT backbone.
+
+    Supplementary C.2 evaluates the HateXplain experiments of Table 2 on both
+    DistilBERT-base and BERT-base. DistilBERT stores its blocks under
+    ``transformer.layer``, names its attention projections ``q_lin``/``v_lin``,
+    and takes no ``token_type_ids``; everything else is shared with
+    :class:`FairNetBERT`.
+    """
+
+    def __init__(
+        self,
+        config: FairNetConfig,
+        num_classes: int = 3,
+        model_name: str = "distilbert-base-uncased",
+        detector_layer: Optional[int] = None,
+        bert_config=None,
+        bert_model=None,
+    ):
+        super().__init__(
+            config,
+            num_classes=num_classes,
+            model_name=model_name,
+            detector_layer=detector_layer,
+            bert_config=bert_config,
+            bert_model=bert_model,
+        )
+
+    @staticmethod
+    def _backbone_class():
+        from transformers import DistilBertModel
+
+        return DistilBertModel
+
+    @staticmethod
+    def _accepts_token_type_ids() -> bool:
+        return False

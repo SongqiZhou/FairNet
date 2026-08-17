@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Dict, List, Optional
@@ -79,12 +80,52 @@ class FairNetTrainer:
         # Compatibility alias used by early examples.
         self.prototype_bank = self.prototype_banks[config.sensitive_attributes[0]]
         self.history = defaultdict(list)
+        #: Set to True after loading an externally trained Stage 1 base model.
+        self.skip_stage1 = False
 
-    def _get_warmup_scheduler(self, optimizer, warmup_steps: int):
+    #: Minimum number of detector-flagged training samples before they are used
+    #: as contrastive anchors. Below this the detector is not informative enough
+    #: to anchor on and the setting's own labels are used instead.
+    _min_detector_anchors = 32
+
+    #: Stage 1 is plain ERM (Section 3.4, step 1), so its checkpoint is chosen
+    #: on overall validation accuracy in every setting. Selecting it on WGA
+    #: would silently turn the shared base model into a fairness-aware baseline
+    #: and would also require sensitive labels the Partial and Unlabeled
+    #: settings do not have.
+    stage1_selection_metric = "accuracy"
+
+    @property
+    def selection_metric(self) -> str:
+        """Validation key used to pick the best Stage 4 checkpoint.
+
+        Supplementary C.3.1 gives FairNet-Full ground-truth sensitive labels for
+        both training and validation, so selecting on validation WGA is legal
+        there. Section 5.1 states that FairNet-Partial sees no validation
+        sensitive labels and FairNet-Unlabeled sees none at all, so those two
+        settings must select on overall validation accuracy instead. Choosing
+        WGA for them would leak the very labels the setting withholds.
+        """
+
+        if self.config.model_selection_metric is not None:
+            return self.config.model_selection_metric
+        if self.config.attribute_mode == AttributeMode.FULL:
+            return "worst_group_accuracy"
+        return "accuracy"
+
+    def _get_warmup_scheduler(
+        self, optimizer, warmup_steps: int, total_steps: Optional[int] = None
+    ):
+        schedule = self.config.lr_schedule
+
         def lr_lambda(step):
-            if warmup_steps <= 0:
-                return 1.0
-            return min(1.0, float(step + 1) / float(warmup_steps))
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            if schedule == "warmup_cosine" and total_steps and total_steps > warmup_steps:
+                progress = (step - warmup_steps) / float(total_steps - warmup_steps)
+                progress = min(max(progress, 0.0), 1.0)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+            return 1.0
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -159,6 +200,63 @@ class FairNetTrainer:
             return nn.functional.binary_cross_entropy(outputs, labels.float().reshape(-1, 1))
         return nn.functional.cross_entropy(outputs, labels.long())
 
+    def _anchor_weights(self, labels: torch.Tensor) -> Optional[torch.Tensor]:
+        """Inverse task-class frequencies for the contrastive anchors.
+
+        Each sensitive attribute has a single shared (A, B) LoRA pair, so the
+        update is an average over whichever anchors appear. CelebA's minority
+        group is 22,880 blond women against 1,387 blond men; left unweighted,
+        the women dominate and the learned correction shifts every triggered
+        face toward "not male", which lowers worst-group accuracy below the ERM
+        baseline it is supposed to improve.
+        """
+
+        if not self.config.class_balanced_contrastive:
+            return None
+        flat = labels.reshape(-1)
+        present = torch.unique(flat)
+        if len(present) < 2:
+            return None
+        weights = torch.ones(flat.shape[0], device=flat.device, dtype=torch.float32)
+        for value in present:
+            mask = flat == value
+            weights[mask] = 1.0 / float(mask.sum())
+        return weights
+
+    def _stage4_task_loss(self, outputs, labels):
+        """Task loss over the triggered samples only.
+
+        Stage 4 sees exclusively the samples the gate opened for, i.e. the
+        minority group. On CelebA that subset is 22,880 blond women against
+        1,387 blond men, so an unweighted average pulls the correction toward
+        "not male" for every blond face and drives the worst group down. When
+        ``class_balanced_stage4_task`` is set, each class in the batch is
+        weighted by its inverse frequency so the correction is not steered by
+        the imbalance it is meant to repair.
+        """
+
+        if not self.config.class_balanced_stage4_task:
+            return self._task_loss(outputs, labels)
+
+        if outputs.shape[-1] == 1:
+            targets = labels.float().reshape(-1, 1)
+            losses = nn.functional.binary_cross_entropy(outputs, targets, reduction="none")
+        else:
+            targets = labels.long()
+            losses = nn.functional.cross_entropy(outputs, targets, reduction="none").reshape(-1, 1)
+
+        flat = labels.reshape(-1)
+        weights = torch.ones_like(losses.reshape(-1))
+        present = torch.unique(flat)
+        if len(present) < 2:
+            # A single class in the batch carries no imbalance to correct.
+            return losses.mean()
+        for value in present:
+            mask = flat == value
+            weights[mask] = 1.0 / float(mask.sum())
+        weights = weights / weights.sum()
+        return (losses.reshape(-1) * weights).sum()
+
     @staticmethod
     def _predictions(outputs):
         if outputs.shape[-1] == 1:
@@ -177,6 +275,12 @@ class FairNetTrainer:
         print("=" * 60)
         if len(train_loader) == 0:
             raise ValueError("train_loader is empty")
+        if self.skip_stage1:
+            # A Stage 1 base model was supplied, so every variant starts from
+            # byte-identical ERM weights and the comparison isolates Stages 2-4.
+            print("Reusing a pre-trained Stage 1 base model; skipping ERM training")
+            self.model.freeze_base()
+            return {"skipped": True}
 
         self.model.unfreeze_base()
         self.model.freeze_detectors()
@@ -192,8 +296,13 @@ class FairNetTrainer:
             lr=self.config.stage1_lr,
             weight_decay=self.config.weight_decay,
         )
-        scheduler = self._get_warmup_scheduler(optimizer, self.config.warmup_steps)
-        best_wga = float("-inf")
+        scheduler = self._get_warmup_scheduler(
+            optimizer,
+            self.config.warmup_steps,
+            total_steps=len(train_loader) * self.config.stage1_epochs,
+        )
+        selection_metric = self.stage1_selection_metric
+        best_score = float("-inf")
         best_state = None
 
         for epoch in range(self.config.stage1_epochs):
@@ -218,19 +327,24 @@ class FairNetTrainer:
             if val_loader is not None:
                 metrics = self._evaluate(val_loader, use_lora=False)
                 self.history["stage1_wga"].append(metrics["worst_group_accuracy"])
+                self.history["stage1_acc"].append(metrics["accuracy"])
                 print(
                     f"Epoch {epoch + 1}: loss={average_loss:.4f}, "
                     f"ACC={metrics['accuracy']:.4f}, "
-                    f"WGA={metrics['worst_group_accuracy']:.4f}"
+                    f"WGA={metrics['worst_group_accuracy']:.4f} "
+                    f"(selecting on {selection_metric})"
                 )
-                if metrics["worst_group_accuracy"] > best_wga:
-                    best_wga = metrics["worst_group_accuracy"]
+                if metrics[selection_metric] > best_score:
+                    best_score = metrics[selection_metric]
                     best_state = copy.deepcopy(self.model.state_dict())
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
         self.model.freeze_base()
-        return {"best_wga": None if best_wga == float("-inf") else best_wga}
+        return {
+            "selection_metric": selection_metric,
+            "best_score": None if best_score == float("-inf") else best_score,
+        }
 
     def _train_detectors(self, train_loader: DataLoader) -> Dict:
         if len(train_loader) == 0:
@@ -334,6 +448,9 @@ class FairNetTrainer:
         print("\n" + "=" * 60)
         print("Stage 3: Building Static Contrastive Prototypes")
         print("=" * 60)
+        if self.config.stage4_objective != "contrastive":
+            print("Stage 4 uses the task loss; contrastive prototypes are not needed")
+            return
         self.model.eval()
         self.model._clear_lora_activation()
 
@@ -387,15 +504,25 @@ class FairNetTrainer:
         if not lora_parameters:
             raise RuntimeError("No LoRA parameters were injected")
         optimizer = optim.Adam(lora_parameters, lr=self.config.stage4_lr)
-        scheduler = self._get_warmup_scheduler(optimizer, min(50, self.config.warmup_steps))
-        contrastive = TripletContrastiveLoss(margin=self.config.contrastive_margin)
-        best_wga = float("-inf")
+        scheduler = self._get_warmup_scheduler(
+            optimizer,
+            min(50, self.config.warmup_steps),
+            total_steps=len(train_loader) * self.config.stage4_epochs,
+        )
+        contrastive = TripletContrastiveLoss(
+            margin=self.config.contrastive_margin,
+            distance_type=self.config.contrastive_distance,
+            normalize=self.config.contrastive_normalize,
+        )
+        selection_metric = self.selection_metric
+        best_score = float("-inf")
         best_state = None
 
         for epoch in range(self.config.stage4_epochs):
             self.model.train()
             total_loss = 0.0
             updated_batches = 0
+            contrastive_terms: List[float] = []
             for batch in tqdm(
                 train_loader,
                 desc=f"Stage 4 epoch {epoch + 1}/{self.config.stage4_epochs}",
@@ -410,21 +537,48 @@ class FairNetTrainer:
                         minority_inputs = {key: value[minority] for key, value in inputs.items()}
                     else:
                         minority_inputs = inputs[minority]
-                    _, corrected = self._forward(
+                    outputs, corrected = self._forward(
                         minority_inputs,
                         return_features=True,
                         force_lora=True,
                         target_attribute=attr,
                     )
+                    # Equation 3 keeps L_task alongside the contrastive term:
+                    # "L_task ensures the model maintains task accuracy". Stage
+                    # 4 is the only stage that still updates trainable weights
+                    # affecting predictions, so dropping L_task here would
+                    # remove the mechanism behind the paper's central
+                    # "without performance loss" claim. Majority samples are
+                    # excluded because their gate is closed and they therefore
+                    # contribute no gradient to the LoRA matrices.
+                    task_loss = self._stage4_task_loss(outputs, labels[minority])
+                    if self.config.stage4_objective == "task":
+                        # Section 5.4 "w/o contrastive loss": the same LoRA
+                        # matrices are trained with the plain task loss on the
+                        # flagged instances instead of Equation 2.
+                        attribute_losses.append(task_loss)
+                        continue
                     positive, negative = self.prototype_banks[attr].get_targets(
-                        labels[minority], anchor_features=corrected
+                        labels[minority],
+                        anchor_features=corrected,
+                        normalize=self.config.contrastive_normalize,
                     )
-                    attribute_losses.append(contrastive(corrected, positive, negative))
+                    contrastive_loss = contrastive(
+                        corrected,
+                        positive,
+                        negative,
+                        weights=self._anchor_weights(labels[minority]),
+                    )
+                    attribute_losses.append(
+                        self.config.stage4_task_weight * task_loss
+                        + self.config.lambda_C * contrastive_loss
+                    )
+                    contrastive_terms.append(float(contrastive_loss.detach()))
 
                 if not attribute_losses:
                     continue
                 optimizer.zero_grad()
-                loss = self.config.lambda_C * torch.stack(attribute_losses).mean()
+                loss = torch.stack(attribute_losses).mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(lora_parameters, self.config.gradient_clip)
                 optimizer.step()
@@ -436,16 +590,33 @@ class FairNetTrainer:
                 raise RuntimeError("No minority samples reached Stage 4; check labels and batching")
             average_loss = total_loss / updated_batches
             self.history["stage4_loss"].append(average_loss)
+            if contrastive_terms:
+                # A contrastive term pinned at exactly zero means the margin is
+                # below the scale of the distances and the triplet hinge never
+                # activates, so the LoRA matrices receive no fairness signal.
+                mean_contrastive = sum(contrastive_terms) / len(contrastive_terms)
+                active = sum(1 for value in contrastive_terms if value > 0)
+                self.history["stage4_contrastive"].append(mean_contrastive)
+                self.history["stage4_contrastive_active_rate"].append(
+                    active / len(contrastive_terms)
+                )
+                if active == 0:
+                    print(
+                        "Warning: the contrastive hinge never activated this epoch. "
+                        "Increase contrastive_margin or keep contrastive_normalize=True."
+                    )
             if val_loader is not None:
                 metrics = self._evaluate(val_loader, use_lora=True)
                 self.history["stage4_wga"].append(metrics["worst_group_accuracy"])
+                self.history["stage4_acc"].append(metrics["accuracy"])
                 print(
                     f"Epoch {epoch + 1}: loss={average_loss:.4f}, "
                     f"ACC={metrics['accuracy']:.4f}, "
-                    f"WGA={metrics['worst_group_accuracy']:.4f}"
+                    f"WGA={metrics['worst_group_accuracy']:.4f} "
+                    f"(selecting on {selection_metric})"
                 )
-                if metrics["worst_group_accuracy"] > best_wga:
-                    best_wga = metrics["worst_group_accuracy"]
+                if metrics[selection_metric] > best_score:
+                    best_score = metrics[selection_metric]
                     best_state = copy.deepcopy(self.model.state_dict())
 
         if best_state is not None:
@@ -463,9 +634,75 @@ class FairNetTrainer:
         self.stage3_build_prototypes(train_loader)
         return self.stage4_train_lora(train_loader, val_loader)
 
-    @staticmethod
-    def _fairness_metrics(labels, predictions, sensitive):
-        return compute_fairness_metrics(labels, predictions, sensitive)
+    def _detector_anchor_loader(self, train_loader: DataLoader) -> Optional[DataLoader]:
+        """Relabel the whole training set with the trained detector.
+
+        Section 3.3 defines a contrastive anchor as a sample "identified as
+        belonging to the minority group (either via ground-truth label s = 1 or
+        predicted as such by the bias detector)". Restricting Stages 3 and 4 to
+        the labelled subset would throw away that second option and leave the
+        correction fitted to a few hundred anchors; scoring every training
+        sample with the detector recovers the full anchor set the paper allows.
+        """
+
+        attr = self.config.sensitive_attributes[0]
+        detector = self.model.bias_detectors[f"detector_{attr}"]
+        stable_loader = DataLoader(
+            train_loader.dataset,
+            batch_size=train_loader.batch_size or self.config.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=train_loader.num_workers,
+            collate_fn=train_loader.collate_fn,
+            pin_memory=train_loader.pin_memory,
+        )
+
+        self.model.eval()
+        predictions = []
+        with torch.no_grad():
+            for batch in tqdm(stable_loader, desc="Scoring detector over training set"):
+                inputs, _, _ = self._unpack_batch(batch)
+                hidden_states = self._get_intermediate_features(inputs)
+                scores = detector(
+                    hidden_states,
+                    is_sequence=True,
+                    attention_mask=self._attention_mask(inputs),
+                )
+                predictions.append(
+                    (scores.reshape(-1) > self.config.activation_threshold).long().cpu()
+                )
+        pseudo_labels = torch.cat(predictions)
+        flagged = int(pseudo_labels.sum().item())
+        print(
+            f"Detector flagged {flagged} of {len(pseudo_labels)} training samples "
+            f"({flagged / len(pseudo_labels):.1%}) as minority"
+        )
+        if flagged < self._min_detector_anchors:
+            # An undertrained or miscalibrated detector can flag (almost)
+            # nothing, which would leave Stage 4 with no anchors at all. Fall
+            # back to whatever labels the setting already had rather than
+            # silently training on an empty anchor set.
+            print(
+                f"Fewer than {self._min_detector_anchors} samples were flagged; "
+                "falling back to the setting's own labels for Stage 3/4 anchors"
+            )
+            return None
+
+        return DataLoader(
+            _RelabeledDataset(train_loader.dataset, pseudo_labels, attribute=attr),
+            batch_size=train_loader.batch_size or self.config.batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=train_loader.num_workers,
+            collate_fn=train_loader.collate_fn,
+            pin_memory=train_loader.pin_memory,
+            generator=torch.Generator().manual_seed(self.config.seed),
+        )
+
+    def _fairness_metrics(self, labels, predictions, sensitive):
+        return compute_fairness_metrics(
+            labels, predictions, sensitive, wga_definition=self.config.wga_definition
+        )
 
     def _evaluate(self, loader: DataLoader, use_lora: bool = True) -> Dict:
         if loader is None or len(loader) == 0:
@@ -564,8 +801,13 @@ class FairNetPartialTrainer(FairNetTrainer):
             f"({self.labeled_fraction:.1%})"
         )
         self.stage2_train_detector(labeled_loader)
-        self.stage3_build_prototypes(labeled_loader)
-        return self.stage4_train_lora(labeled_loader, val_loader)
+        anchor_loader = None
+        if self.config.anchor_source == "detector":
+            anchor_loader = self._detector_anchor_loader(train_loader)
+        if anchor_loader is None:
+            anchor_loader = labeled_loader
+        self.stage3_build_prototypes(anchor_loader)
+        return self.stage4_train_lora(anchor_loader, val_loader)
 
 
 class FairNetUnlabeledTrainer(FairNetTrainer):
@@ -581,6 +823,7 @@ class FairNetUnlabeledTrainer(FairNetTrainer):
             hidden_dim=model.hidden_dim,
             n_neighbors=config.lof_n_neighbors,
             contamination=config.lof_contamination,
+            n_jobs=config.lof_n_jobs,
         )
         self.pseudo_labels: Optional[torch.Tensor] = None
         self._pseudo_loader: Optional[DataLoader] = None
@@ -607,7 +850,16 @@ class FairNetUnlabeledTrainer(FairNetTrainer):
             for batch in tqdm(stable_loader, desc="Extracting stable-order features"):
                 inputs, _, _ = self._unpack_batch(batch)
                 hidden_states = self._get_intermediate_features(inputs)
-                features.append(hidden_states[:, 0].cpu())
+                if self.config.lof_feature == "mean":
+                    mask = self._attention_mask(inputs)
+                    if mask is None:
+                        pooled = hidden_states.mean(dim=1)
+                    else:
+                        weights = mask.unsqueeze(-1).to(hidden_states.dtype)
+                        pooled = (hidden_states * weights).sum(1) / weights.sum(1).clamp_min(1e-6)
+                else:
+                    pooled = hidden_states[:, 0]
+                features.append(pooled.cpu())
         all_features = torch.cat(features)
         self.pseudo_labels = self.unsupervised_detector.fit_predict(all_features).cpu()
 
@@ -636,5 +888,13 @@ class FairNetUnlabeledTrainer(FairNetTrainer):
     def train_full(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None) -> Dict:
         self.stage1_train_base(train_loader, val_loader)
         self.stage2_generate_pseudo_labels(train_loader)
-        self.stage3_build_prototypes(self._pseudo_loader)
-        return self.stage4_train_lora(self._pseudo_loader, val_loader)
+        # Same Section 3.3 reading as the partial setting: once the neural
+        # detector has been trained on the LOF pseudo-labels, its own
+        # predictions are what identifies an anchor, not the raw LOF output.
+        anchor_loader = None
+        if self.config.anchor_source == "detector":
+            anchor_loader = self._detector_anchor_loader(train_loader)
+        if anchor_loader is None:
+            anchor_loader = self._pseudo_loader
+        self.stage3_build_prototypes(anchor_loader)
+        return self.stage4_train_lora(anchor_loader, val_loader)

@@ -7,7 +7,7 @@ import warnings
 
 import fairnet as _fairnet
 from fairnet import *  # noqa: F403
-from fairnet import config, datasets, models, modules, trainers, utils
+from fairnet import config, datasets, models, modules, text_datasets, trainers, utils
 
 warnings.warn(
     "The 'scr' package name is deprecated; import from 'fairnet' instead.",
@@ -15,7 +15,7 @@ warnings.warn(
     stacklevel=2,
 )
 
-for _module in (config, datasets, models, modules, trainers, utils):
+for _module in (config, datasets, models, modules, text_datasets, trainers, utils):
     sys.modules[f"{__name__}.{_module.__name__.rsplit('.', 1)[-1]}"] = _module
 
 __all__ = _fairnet.__all__
