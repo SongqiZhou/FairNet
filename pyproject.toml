@@ -32,11 +32,18 @@ dependencies = [
   "torch>=2.1",
   "torchvision>=0.16",
   "tqdm>=4.65",
-  "transformers>=4.40,<5",
+  "transformers>=4.40",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.9"]
+# Extras needed only to run the paper-reproduction scripts under experiments/.
+experiments = [
+  "PyYAML>=6",
+  "datasets>=2.18",
+  "huggingface_hub>=0.23",
+  "pyarrow>=14",
+]
 
 [project.urls]
 Homepage = "https://github.com/SongqiZhou/FairNet"

@@ -207,7 +207,13 @@ class UnsupervisedBiasDetector(nn.Module):
         contamination: Expected proportion of outliers (minority rate)
     """
 
-    def __init__(self, hidden_dim: int, n_neighbors: int = 20, contamination: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_neighbors: int = 20,
+        contamination: float = 0.1,
+        n_jobs: Optional[int] = None,
+    ):
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive")
@@ -218,6 +224,9 @@ class UnsupervisedBiasDetector(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_neighbors = n_neighbors
         self.contamination = contamination
+        # Purely a throughput knob: LOF over CelebA's 162,770 x 768 training
+        # representations takes about a minute with several workers.
+        self.n_jobs = n_jobs
         self.lof: Optional[LocalOutlierFactor] = None
         self.fitted = False
         self.score_mean = 0.0
@@ -239,6 +248,7 @@ class UnsupervisedBiasDetector(nn.Module):
             n_neighbors=min(self.n_neighbors, len(features_np) - 1),
             contamination=self.contamination,
             novelty=True,  # Enable prediction on new data
+            n_jobs=self.n_jobs,
         )
         self.lof.fit(features_np)
         training_scores = -self.lof.score_samples(features_np)
@@ -442,18 +452,87 @@ class LoRALinear(nn.Module):
 # =============================================================================
 
 
+#: Where each encoder architecture keeps its list of transformer blocks.
+_LAYER_STACK_PATHS = (
+    "encoder.layer",  # BERT (all versions), ViT in transformers 4.x
+    "layers",  # ViT in transformers 5.x
+    "transformer.layer",  # DistilBERT
+)
+
+#: Attribute paths, relative to one transformer block, for each logical
+#: projection FairNet can adapt. Several are listed per projection because
+#: Hugging Face renamed the attention submodules in transformers 5.
+_PROJECTION_PATHS = {
+    "query": (
+        "attention.attention.query",
+        "attention.self.query",
+        "attention.q_proj",
+        "attention.q_lin",
+    ),
+    "key": (
+        "attention.attention.key",
+        "attention.self.key",
+        "attention.k_proj",
+        "attention.k_lin",
+    ),
+    "value": (
+        "attention.attention.value",
+        "attention.self.value",
+        "attention.v_proj",
+        "attention.v_lin",
+    ),
+    "dense": ("attention.output.dense", "attention.o_proj", "attention.out_lin"),
+}
+
+
+def _resolve_attribute(root: nn.Module, path: str) -> Optional[Tuple[nn.Module, str]]:
+    """Walk a dotted attribute path and return ``(parent, final_attribute)``."""
+
+    parts = path.split(".")
+    current = root
+    for part in parts[:-1]:
+        if not hasattr(current, part):
+            return None
+        current = getattr(current, part)
+    if not hasattr(current, parts[-1]):
+        return None
+    return current, parts[-1]
+
+
+def get_encoder_layers(model: nn.Module) -> nn.ModuleList:
+    """Return a backbone's list of transformer blocks.
+
+    Hugging Face moved ViT's blocks from ``encoder.layer`` to ``layers`` in
+    transformers 5, and DistilBERT keeps them under ``transformer.layer``.
+    Resolving the stack by search keeps FairNet working across all of them
+    instead of pinning the package to one major version.
+    """
+
+    for path in _LAYER_STACK_PATHS:
+        resolved = _resolve_attribute(model, path)
+        if resolved is not None:
+            parent, attribute = resolved
+            layers = getattr(parent, attribute)
+            if isinstance(layers, (nn.ModuleList, list)):
+                return layers
+    raise AttributeError(
+        f"{type(model).__name__} has no recognised transformer block stack; "
+        f"tried {list(_LAYER_STACK_PATHS)}"
+    )
+
+
 class LoRAInjector:
     """
     Utility class to inject LoRA modules into transformer models.
 
-    Supports injecting into:
-    - ViT attention layers (query, key, value, dense)
-    - BERT attention layers (query, key, value, dense)
+    Supports the query, key, value, and attention-output projections of ViT,
+    BERT, and DistilBERT backbones, on both the transformers 4.x and 5.x module
+    layouts.
     """
 
     @staticmethod
-    def inject_lora_into_vit(
-        vit_model,
+    def inject(
+        model: nn.Module,
         rank: int = 8,
         alpha: float = 16.0,
         threshold: float = 0.5,
@@ -463,131 +542,71 @@ class LoRAInjector:
         adapter_names: Optional[List[str]] = None,
     ) -> Dict[str, LoRALinear]:
         """
-        Inject LoRA into ViT attention layers.
+        Inject conditional LoRA into a transformer backbone's attention layers.
 
         Args:
-            vit_model: HuggingFace ViTModel
-            rank: LoRA rank
-            alpha: LoRA scaling factor
-            threshold: Activation threshold
+            model: A Hugging Face encoder (``ViTModel``, ``BertModel``, ...)
+            rank: LoRA rank r
+            alpha: LoRA scaling factor alpha
+            threshold: Activation threshold tau
             dropout: LoRA dropout
-            target_modules: Which projections to apply LoRA to
-            target_layers: Which layers (None = all)
+            target_modules: Which projections to adapt (default query + value)
+            target_layers: Which layer indices (None = all)
+            adapter_names: One adapter per sensitive attribute
 
         Returns:
-            Dictionary of injected LoRALinear modules
+            Dictionary of injected LoRALinear modules keyed by layer and target
         """
-        lora_modules = {}
-        num_layers = len(vit_model.encoder.layer)
         target_modules = target_modules or ["query", "value"]
-        unknown_modules = set(target_modules) - {"query", "key", "value", "dense"}
+        unknown_modules = set(target_modules) - set(_PROJECTION_PATHS)
         if unknown_modules:
-            raise ValueError(f"Unknown ViT LoRA targets: {sorted(unknown_modules)}")
+            raise ValueError(f"Unknown LoRA targets: {sorted(unknown_modules)}")
+
+        layers = get_encoder_layers(model)
+        num_layers = len(layers)
         if target_layers is None:
             target_layers = list(range(num_layers))
 
+        lora_modules: Dict[str, LoRALinear] = {}
         for layer_idx in target_layers:
             if not 0 <= layer_idx < num_layers:
-                raise IndexError(f"ViT layer index out of range: {layer_idx}")
-
-            layer = vit_model.encoder.layer[layer_idx]
-            attention = layer.attention.attention
+                raise IndexError(f"Layer index out of range: {layer_idx}")
+            layer = layers[layer_idx]
 
             for module_name in target_modules:
-                if module_name == "query":
-                    original = attention.query
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.query = lora
-                    lora_modules[f"layer_{layer_idx}_query"] = lora
-
-                elif module_name == "key":
-                    original = attention.key
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.key = lora
-                    lora_modules[f"layer_{layer_idx}_key"] = lora
-
-                elif module_name == "value":
-                    original = attention.value
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.value = lora
-                    lora_modules[f"layer_{layer_idx}_value"] = lora
-
-                elif module_name == "dense":
-                    original = layer.attention.output.dense
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    layer.attention.output.dense = lora
-                    lora_modules[f"layer_{layer_idx}_dense"] = lora
+                resolved = None
+                for path in _PROJECTION_PATHS[module_name]:
+                    resolved = _resolve_attribute(layer, path)
+                    if resolved is not None:
+                        break
+                if resolved is None:
+                    raise AttributeError(
+                        f"{type(model).__name__} layer {layer_idx} exposes no "
+                        f"'{module_name}' projection; tried "
+                        f"{list(_PROJECTION_PATHS[module_name])}"
+                    )
+                parent, attribute = resolved
+                original = getattr(parent, attribute)
+                if isinstance(original, LoRALinear):
+                    raise ValueError(
+                        f"LoRA is already injected at layer {layer_idx} '{module_name}'"
+                    )
+                if not isinstance(original, nn.Linear):
+                    raise TypeError(
+                        f"Layer {layer_idx} '{module_name}' is a "
+                        f"{type(original).__name__}, not nn.Linear"
+                    )
+                lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
+                setattr(parent, attribute, lora)
+                lora_modules[f"layer_{layer_idx}_{module_name}"] = lora
 
         return lora_modules
 
-    @staticmethod
-    def inject_lora_into_bert(
-        bert_model,
-        rank: int = 8,
-        alpha: float = 16.0,
-        threshold: float = 0.5,
-        dropout: float = 0.0,
-        target_modules: Optional[List[str]] = None,
-        target_layers: Optional[List[int]] = None,
-        adapter_names: Optional[List[str]] = None,
-    ) -> Dict[str, LoRALinear]:
-        """
-        Inject LoRA into BERT attention layers.
-
-        Args:
-            bert_model: HuggingFace BertModel
-            rank: LoRA rank
-            alpha: LoRA scaling factor
-            threshold: Activation threshold
-            dropout: LoRA dropout
-            target_modules: Which projections to apply LoRA to
-            target_layers: Which layers (None = all)
-
-        Returns:
-            Dictionary of injected LoRALinear modules
-        """
-        lora_modules = {}
-        num_layers = len(bert_model.encoder.layer)
-        target_modules = target_modules or ["query", "value"]
-        unknown_modules = set(target_modules) - {"query", "key", "value", "dense"}
-        if unknown_modules:
-            raise ValueError(f"Unknown BERT LoRA targets: {sorted(unknown_modules)}")
-        if target_layers is None:
-            target_layers = list(range(num_layers))
-
-        for layer_idx in target_layers:
-            if not 0 <= layer_idx < num_layers:
-                raise IndexError(f"BERT layer index out of range: {layer_idx}")
-
-            layer = bert_model.encoder.layer[layer_idx]
-            attention = layer.attention.self
-
-            for module_name in target_modules:
-                if module_name == "query":
-                    original = attention.query
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.query = lora
-                    lora_modules[f"layer_{layer_idx}_query"] = lora
-
-                elif module_name == "key":
-                    original = attention.key
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.key = lora
-                    lora_modules[f"layer_{layer_idx}_key"] = lora
-
-                elif module_name == "value":
-                    original = attention.value
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    attention.value = lora
-                    lora_modules[f"layer_{layer_idx}_value"] = lora
-
-                elif module_name == "dense":
-                    original = layer.attention.output.dense
-                    lora = LoRALinear(original, rank, alpha, threshold, dropout, adapter_names)
-                    layer.attention.output.dense = lora
-                    lora_modules[f"layer_{layer_idx}_dense"] = lora
-
-        return lora_modules
+    # Backwards-compatible aliases. The generic implementation resolves the
+    # architecture itself, so these all forward to :meth:`inject`.
+    inject_lora_into_vit = inject
+    inject_lora_into_bert = inject
+    inject_lora_into_distilbert = inject
 
 
 # =============================================================================
@@ -608,33 +627,71 @@ class TripletContrastiveLoss(nn.Module):
         - D: distance function (Euclidean or cosine)
         - margin: minimum separation margin
 
+    **On the distance and the margin.** Supplementary C.3.2 states a Euclidean
+    distance and a margin tuned "between 0.1 and 1.0". Only one combination
+    makes both statements true at once, and the defaults here are that
+    combination: plain (not squared) Euclidean distance over L2-normalised
+    representations.
+
+    Measured on a trained CelebA backbone, the gap ``d_neg - d_pos`` behaves as
+    follows for the minority anchors:
+
+    * Raw squared Euclidean on unnormalised features: distances are ~150 and
+      ~1700 because the prototypes have norm ~23. A margin of 0.5 is three
+      orders of magnitude too small and the hinge is open on 0% of anchors, so
+      the LoRA modules never receive a gradient.
+    * Squared Euclidean on normalised features: the gap concentrates at ~2.08
+      (range 1.76-2.38), so the hinge needs a margin around 2.0-2.5 and the
+      paper's range is still far too small - 0.1% of anchors at margin 0.5.
+    * Plain Euclidean on normalised features: distances lie in [0, 2] and the
+      gap lands near 1.0, exactly where a margin in [0.1, 1.0] selects between
+      "correct only the hardest anchors" and "correct about half of them".
+
     Args:
-        margin: Margin m for triplet loss (paper uses m=0.5)
-        distance_type: "euclidean" or "cosine"
+        margin: Margin m for triplet loss (paper tunes m in [0.1, 1.0])
+        distance_type: "euclidean" (default), "squared_euclidean", or "cosine"
+        normalize: L2-normalise representations before measuring distance
     """
 
-    def __init__(self, margin: float = 0.5, distance_type: str = "euclidean"):
+    DISTANCE_TYPES = ("euclidean", "squared_euclidean", "cosine")
+
+    def __init__(
+        self,
+        margin: float = 0.5,
+        distance_type: str = "euclidean",
+        normalize: bool = True,
+    ):
         super().__init__()
         if margin < 0:
             raise ValueError("margin cannot be negative")
-        if distance_type not in {"euclidean", "cosine"}:
-            raise ValueError("distance_type must be 'euclidean' or 'cosine'")
+        if distance_type not in self.DISTANCE_TYPES:
+            raise ValueError(f"distance_type must be one of {self.DISTANCE_TYPES}")
         self.margin = margin
         self.distance_type = distance_type
+        self.normalize = normalize
 
     def _compute_distance(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Compute pairwise distance."""
-        if self.distance_type == "euclidean":
-            return torch.sum((x1 - x2) ** 2, dim=-1)
-        elif self.distance_type == "cosine":
-            x1_norm = F.normalize(x1, p=2, dim=-1)
-            x2_norm = F.normalize(x2, p=2, dim=-1)
-            return 1 - torch.sum(x1_norm * x2_norm, dim=-1)
-        else:
-            raise ValueError(f"Unknown distance type: {self.distance_type}")
+        if self.distance_type == "cosine":
+            x1 = F.normalize(x1, p=2, dim=-1)
+            x2 = F.normalize(x2, p=2, dim=-1)
+            return 1 - torch.sum(x1 * x2, dim=-1)
+        if self.normalize:
+            x1 = F.normalize(x1, p=2, dim=-1)
+            x2 = F.normalize(x2, p=2, dim=-1)
+        squared = torch.sum((x1 - x2) ** 2, dim=-1)
+        if self.distance_type == "squared_euclidean":
+            return squared
+        # Plain Euclidean, which is what Supplementary C.3.2 states. clamp_min
+        # keeps the gradient finite when an anchor coincides with its target.
+        return torch.sqrt(squared.clamp_min(1e-12))
 
     def forward(
-        self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor
+        self,
+        anchor: torch.Tensor,
+        positive: torch.Tensor,
+        negative: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute triplet contrastive loss.
@@ -643,6 +700,9 @@ class TripletContrastiveLoss(nn.Module):
             anchor: [batch, dim] minority sample representations
             positive: [batch, dim] same-class majority prototypes
             negative: [batch, dim] different-class majority prototypes
+            weights: optional [batch] per-anchor weights, renormalised to sum
+                to one. Used to stop one task class from dominating the shared
+                LoRA update; see ``FairNetTrainer.stage4_train_lora``.
 
         Returns:
             Scalar loss value
@@ -653,7 +713,15 @@ class TripletContrastiveLoss(nn.Module):
         # Hinge loss: [d_pos - d_neg + margin]_+
         loss = torch.clamp(d_pos - d_neg + self.margin, min=0.0)
 
-        return loss.mean()
+        if weights is None:
+            return loss.mean()
+        weights = weights.reshape(-1).to(device=loss.device, dtype=loss.dtype)
+        if weights.shape != loss.shape:
+            raise ValueError("weights must have one entry per anchor")
+        total = weights.sum()
+        if total <= 0:
+            raise ValueError("anchor weights must sum to a positive value")
+        return (loss * weights).sum() / total
 
 
 # =============================================================================
@@ -783,6 +851,7 @@ class StaticPrototypeBank:
         anchor_labels: torch.Tensor,
         majority_group: int = 0,
         anchor_features: Optional[torch.Tensor] = None,
+        normalize: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get positive and negative prototype targets for anchors.
@@ -830,7 +899,16 @@ class StaticPrototypeBank:
                 neg_targets.append(negative_candidates[0])
             else:
                 candidates = torch.stack(negative_candidates)
-                distances = torch.sum((candidates - anchor_features[index].detach()) ** 2, dim=-1)
+                anchor = anchor_features[index].detach()
+                # Mine the hard negative under the same geometry the loss uses,
+                # otherwise prototypes with slightly larger norms are picked for
+                # the wrong reason.
+                if normalize:
+                    reference = F.normalize(candidates, p=2, dim=-1)
+                    anchor = F.normalize(anchor, p=2, dim=-1)
+                else:
+                    reference = candidates
+                distances = torch.sum((reference - anchor) ** 2, dim=-1)
                 neg_targets.append(candidates[torch.argmin(distances)])
 
         return torch.stack(pos_targets), torch.stack(neg_targets)

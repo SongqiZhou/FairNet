@@ -1,0 +1,53 @@
+# Table 2, BERT-base column: intersectional debiasing on HateXplain.
+#
+# Section 5.3 applies a progressive strategy - first the race ("African
+# American") correction, then the gender ("Female") one. Supplementary C.3.3
+# gives each attribute its own detector and its own (A, B) LoRA pair, and sums
+# the triggered updates. This config is the second stage of that progression
+# ("FairNet Fe."), which carries both attributes; run
+# `hatexplain_bert_race.yaml` for the "FairNet Afr." column.
+
+dataset: hatexplain
+variant: partial
+
+data:
+  num_workers: 4
+  sensitive_axes: [race, gender]
+
+model:
+  kind: bert
+  model_name: bert-base-uncased
+  num_classes: 3
+
+fairnet:
+  hidden_dim: 768
+  batch_size: 32
+  max_seq_length: 128
+
+  # Column 0 is race and column 1 is gender in the `sensitive` matrix; the
+  # placeholder target index simply has to sit outside that range.
+  target_attribute: 2
+  sensitive_attributes: [0, 1]
+
+  detector_layer: 6
+  detector_hidden: 128
+  detector_num_layers: 2
+
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  lora_layers: [6, 7, 8, 9, 10, 11]
+  lora_target_modules: [query, value]
+  activation_threshold: 0.7
+
+  contrastive_margin: 0.5
+  labeled_fraction: 0.10
+  stage1_epochs: 5
+  stage1_lr: 0.00002
+  stage2_epochs: 5
+  stage2_lr: 0.0001
+  stage4_epochs: 5
+  stage4_lr: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 200
+  lr_schedule: warmup_cosine

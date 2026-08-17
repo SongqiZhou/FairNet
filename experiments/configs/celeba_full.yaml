@@ -1,0 +1,5 @@
+# FairNet-Full (Table 1, "Group Info Train/Test = check/check").
+# Supplementary C.3.1: with complete labels the detector MLP is not trained and
+# the known group label itself is the deterministic activation switch.
+base: celeba_base
+variant: full

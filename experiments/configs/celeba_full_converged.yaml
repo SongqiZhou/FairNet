@@ -1,0 +1,9 @@
+# The same setup trained to convergence instead of stopping short. Provided
+# alongside the main rows because FairNet's gain depends strongly on how much
+# minority underfitting is left for the correction to repair. The margin is
+# larger here because a converged backbone widens d_neg - d_pos.
+base: celeba_base
+variant: full
+fairnet:
+  stage1_epochs: 30
+  contrastive_margin: 1.0

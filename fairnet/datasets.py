@@ -362,8 +362,13 @@ def create_celeba_loaders(
     target_attr: int = 20,
     sensitive_attr: int = 9,
     seed: int = 42,
+    drop_last: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create CelebA data loaders with standard transforms.
+
+    Preprocessing follows Supplementary C.1: resize and centre crop to
+    ``image_size`` and normalise with ImageNet statistics. Only the training
+    loader is shuffled and augmented.
 
     Args:
         root: CelebA root directory
@@ -371,6 +376,10 @@ def create_celeba_loaders(
         image_size: Image resize size
         num_workers: Number of data loader workers
         seed: DataLoader shuffling seed
+        drop_last: Drop the final partial training batch. The paper's
+            Supplementary Table 5 reports 162,688 labelled training samples at
+            100% coverage, which is exactly ``162770 // 128 * 128``, so the
+            original runs dropped the last batch at ``batch_size=128``.
 
     Returns:
         train_loader, val_loader, test_loader
@@ -425,7 +434,8 @@ def create_celeba_loaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        drop_last=False,
+        drop_last=drop_last,
+        persistent_workers=num_workers > 0,
         generator=torch.Generator().manual_seed(seed),
     )
 

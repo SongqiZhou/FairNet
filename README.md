@@ -27,12 +27,20 @@ prototype.
 ## What is implemented
 
 - ViT models trained from scratch, matching the paper's CelebA backbone design.
-- Pretrained BERT models for multiclass text classification.
+- Pretrained BERT and DistilBERT models for multiclass text classification,
+  covering both backbones of Table 2.
 - Independent detector and LoRA parameters for every sensitive attribute.
 - Full, partial, and unlabeled sensitive-label settings.
 - Binary and multiclass task losses and fairness evaluation.
-- CelebA, UTKFace, and deterministic synthetic vision datasets; text datasets
-  can use the documented batch contract below.
+- CelebA, UTKFace, and deterministic synthetic vision datasets; MultiNLI and
+  HateXplain loaders with the paper's sensitive-attribute definitions; any other
+  text dataset can use the documented batch contract below.
+- Runnable reproduction scripts for every table the paper reports, with the
+  published numbers checked in for automatic comparison. See
+  **[REPRODUCTION.md](REPRODUCTION.md)**.
+
+The library works with both `transformers` 4.x and 5.x, which use different
+module layouts for ViT and DistilBERT attention.
 
 The maintained import package is `fairnet`. The original repository used the
 misspelled directory name `scr`; it remains as a deprecated compatibility alias
@@ -56,8 +64,14 @@ The three variants differ at stages 2–4:
 | Variant | Sensitive labels during training | Switch used at inference | Contrastive anchors |
 | --- | --- | --- | --- |
 | `FairNet-Full` | Complete | Ground-truth binary group label | Ground-truth minority samples |
-| `FairNet-Partial` | A configurable labeled fraction | Learned detector | Labeled minority subset |
-| `FairNet-Unlabeled` | None | Detector trained from LOF pseudo-labels | Pseudo-minority samples |
+| `FairNet-Partial` | A configurable labeled fraction | Learned detector | Detector-flagged samples |
+| `FairNet-Unlabeled` | None | Detector trained from LOF pseudo-labels | Detector-flagged samples |
+
+Section 3.3 defines an anchor as a sample identified as minority "either via
+ground-truth label `s = 1` or predicted as such by the bias detector", so
+Partial and Unlabeled anchor on everything their trained detector flags rather
+than only on the labels they started with, which fits the correction to far more
+samples. Set `anchor_source="given"` for the narrower reading.
 
 Full mode intentionally does **not** train the MLP detector: Appendix C.3.1
 defines the known group label itself as the deterministic switch. Consequently,
@@ -285,27 +299,54 @@ model = FairNetBERT(
 attribute and exposes the first as the top-level result:
 
 - **ACC:** overall task accuracy.
-- **WGA:** minimum accuracy across sensitive groups, matching Appendix C.4.
+- **WGA:** minimum accuracy across `(task label, sensitive group)` cells, which
+  is the convention behind the paper's Table 1 and every baseline it compares
+  against. See the note below.
 - **EOD:** equalized-odds difference; multiclass tasks use a macro one-vs-rest
   extension.
 - **EOp** and **DP:** equal-opportunity and demographic-parity differences.
-- Per-group and label-by-group diagnostic accuracies.
+- Per-group and label-by-group accuracies and cell counts.
 - Per-attribute LoRA activation rates.
 
-The label-by-group diagnostics do not enter WGA. This distinction matters when
-class prevalence differs sharply between sensitive groups.
+### A note on the two WGA definitions
+
+Appendix C.4 writes WGA as a minimum over the two *sensitive groups*, but the
+numbers in Table 1 are the minimum over the *label-by-group cells*. On CelebA
+the blond group contains 29,983 images of which only 1,749 are male, so simply
+predicting "not male" for every blond image already scores 94.2% on that group —
+the reported ERM WGA of 77.9% cannot be a sensitive-group minimum. On MultiNLI
+the reported ERM pair (82.6 / 67.3) matches the standard six-cell worst-group
+accuracy for that dataset.
+
+`compute_fairness_metrics()` therefore defaults to the Table 1 convention and
+always returns both values explicitly:
+
+```python
+metrics["worst_group_accuracy"]              # follows wga_definition
+metrics["worst_label_group_cell_accuracy"]   # Table 1 convention
+metrics["worst_sensitive_group_accuracy"]    # literal Appendix C.4 formula
+```
+
+Pass `wga_definition="sensitive_group"`, or set
+`FairNetConfig.wga_definition`, to report the Appendix C.4 formula instead.
 
 ## Results reported in the paper
 
-These are the FairNet rows from Table 1 of the paper and require the original
-data splits, preprocessing, tuning, and hardware; they are not expected from
-the small synthetic example.
+These are the rows from Table 1 of the paper. They require the original data
+splits, preprocessing, tuning, and hardware; they are not expected from the
+small synthetic example above.
 
 | Variant | CelebA ACC | CelebA WGA | CelebA EOD | MultiNLI ACC | MultiNLI WGA | MultiNLI EOD |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ERM (baseline) | 95.8 | 77.9 | 10.6 | 82.6 | 67.3 | 12.5 |
 | FairNet-Unlabeled | 95.8 | 82.3 | 7.3 | 82.5 | 73.1 | 8.1 |
 | FairNet-Partial | 95.9 | 86.5 | 5.6 | 82.6 | 76.5 | 6.2 |
 | FairNet-Full | 95.9 | 88.2 | 3.8 | 82.6 | 78.5 | 4.7 |
+
+`experiments/` contains a runnable configuration for every row above, plus the
+ablations and supplementary tables. See **[REPRODUCTION.md](REPRODUCTION.md)**
+for data preparation, the command per table, and the choices this
+implementation makes where the paper leaves something open.
 
 ## Checkpoints
 
