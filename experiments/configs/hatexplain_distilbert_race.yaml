@@ -1,0 +1,6 @@
+# Table 2, DistilBERT-base "FairNet Afr." column.
+base: hatexplain_distilbert
+data:
+  sensitive_axes: [race]
+fairnet:
+  sensitive_attributes: [0]

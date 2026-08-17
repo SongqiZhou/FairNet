@@ -1,0 +1,9 @@
+# Table 2, DistilBERT-base column ("FairNet Fe.": both axes corrected).
+base: hatexplain_bert
+model:
+  kind: distilbert
+  model_name: distilbert-base-uncased
+  num_classes: 3
+fairnet:
+  detector_layer: 3
+  lora_layers: [3, 4, 5]

@@ -1,0 +1,5 @@
+base: multinli_base
+variant: unlabeled
+fairnet:
+  lof_n_neighbors: 20
+  lof_contamination: 0.2

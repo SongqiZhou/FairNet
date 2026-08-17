@@ -1,0 +1,7 @@
+# Table 2 "FairNet Afr." column: the first stage of the progressive strategy,
+# correcting only the race axis.
+base: hatexplain_bert
+data:
+  sensitive_axes: [race]
+fairnet:
+  sensitive_attributes: [0]

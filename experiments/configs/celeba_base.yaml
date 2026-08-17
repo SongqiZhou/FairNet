@@ -1,0 +1,80 @@
+# Shared CelebA setup for the Table 1 rows.
+#
+# Backbone: the scratch-trained ViT of Supplementary C.2
+#   ViTConfig(num_hidden_layers=8, num_attention_heads=8,
+#             intermediate_size=768, image_size=64, patch_size=16)
+# Task: predict "Male" (attribute 20); sensitive attribute "Blond Hair" (9).
+# Batch size 128 with drop_last reproduces the 162,688 labelled training
+# samples reported for 100% coverage in Supplementary Table 5.
+
+dataset: celeba
+variant: erm
+
+data:
+  root: data/celeba
+  num_workers: 8
+  drop_last: true
+
+model:
+  kind: vit
+  image_size: 64
+  patch_size: 16
+  num_channels: 3
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  intermediate_size: 768
+  hidden_dropout_prob: 0.0
+  attention_probs_dropout_prob: 0.0
+
+fairnet:
+  hidden_dim: 768
+  image_size: 64
+  batch_size: 128
+
+  target_attribute: 20
+  sensitive_attributes: [9]
+
+  # Bias detector (Supplementary C.3.1): attention pooling over an intermediate
+  # layer followed by a small MLP.
+  detector_layer: 4
+  detector_hidden: 128
+  detector_num_layers: 2
+
+  # Conditional LoRA (Section 3.3) on the query and value projections of the
+  # second half of the encoder.
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  lora_layers: [4, 5, 6, 7]
+  lora_target_modules: [query, value]
+  activation_threshold: 0.5
+
+  # Contrastive loss (Equation 2), with the Euclidean distance of Supplementary
+  # C.3.2 over L2-normalised representations. The margin is compared against
+  # d_neg - d_pos, whose scale depends on how converged the backbone is, so it
+  # does not transfer between Stage 1 budgets. Retune it on validation WGA
+  # whenever the backbone or the budget changes; see REPRODUCTION.md section 4.2.
+  contrastive_margin: 0.5
+  lambda_D: 1.0
+  lambda_C: 1.0
+
+  # Stage 1 trains the ViT from scratch. The learning rate was selected on
+  # validation accuracy.
+  #
+  # The epoch budget is the setting that decides which regime you are in, not a
+  # detail. A short budget leaves the base model still underfitting the minority
+  # group, which is the condition the contrastive correction is designed to
+  # exploit and the regime Table 1's ERM row sits in. Training to convergence
+  # gives a better baseline overall but leaves far less for the correction to
+  # repair. See celeba_erm_converged.yaml and REPRODUCTION.md section 4.1.
+  stage1_epochs: 2
+  stage1_lr: 0.00005
+  stage2_epochs: 5
+  stage2_lr: 0.0001
+  stage4_epochs: 10
+  stage4_lr: 0.0001
+  weight_decay: 0.05
+  warmup_steps: 500
+  gradient_clip: 1.0
+  lr_schedule: warmup_cosine

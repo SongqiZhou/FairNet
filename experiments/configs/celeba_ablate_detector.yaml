@@ -1,0 +1,7 @@
+# Table 3 "w/o detector": Section 5.4 disables the bias detector so the
+# conditional LoRA stays active on every input. Setting tau = 0 makes the gate
+# fire unconditionally, which is exactly the tau = 0.0 row of Supplementary
+# Table I (TPR = FPR = 100%).
+base: celeba_partial
+fairnet:
+  activation_threshold: 0.0

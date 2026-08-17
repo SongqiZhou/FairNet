@@ -1,0 +1,3 @@
+# ERM row of Table 1: the Stage 1 base model with the correction never engaged.
+base: celeba_base
+variant: erm

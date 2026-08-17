@@ -1,0 +1,4 @@
+base: multinli_base
+variant: partial
+fairnet:
+  labeled_fraction: 0.10

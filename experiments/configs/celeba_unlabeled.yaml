@@ -1,0 +1,9 @@
+# FairNet-Unlabeled (Table 1, "x / x"). Supplementary D.2 replaces the
+# supervised detector with Local Outlier Factor pseudo-labels on intermediate
+# representations, which then train the model's own neural detector.
+base: celeba_base
+variant: unlabeled
+fairnet:
+  lof_n_neighbors: 20
+  lof_contamination: 0.15
+  lof_n_jobs: 8

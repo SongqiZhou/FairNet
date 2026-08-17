@@ -1,0 +1,53 @@
+# Shared MultiNLI setup for the Table 1 language columns.
+#
+# Supplementary C.1/C.2: three-way NLI with BERT-Base-Uncased, negation cues in
+# the hypothesis as the sensitive attribute. MultiNLI's official test-matched
+# labels are withheld by the benchmark, so `split_scheme: matched` trains on the
+# official train split and deterministically halves validation-matched into
+# validation and test. Set `split_scheme: groupdro` for the 50/20/30 split used
+# by Sagawa et al., under which several Table 1 baselines were published.
+
+dataset: multinli
+variant: erm
+
+data:
+  num_workers: 4
+  split_scheme: matched
+
+model:
+  kind: bert
+  model_name: bert-base-uncased
+  num_classes: 3
+
+fairnet:
+  hidden_dim: 768
+  batch_size: 32
+  max_seq_length: 128
+
+  # Text batches carry their own `labels` and `sensitive` columns, so
+  # target_attribute is only a placeholder that must differ from the sensitive
+  # column index.
+  target_attribute: 1
+  sensitive_attributes: [0]
+
+  detector_layer: 6
+  detector_hidden: 128
+  detector_num_layers: 2
+
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  lora_layers: [6, 7, 8, 9, 10, 11]
+  lora_target_modules: [query, value]
+  activation_threshold: 0.5
+
+  contrastive_margin: 0.5
+  stage1_epochs: 3
+  stage1_lr: 0.00002
+  stage2_epochs: 3
+  stage2_lr: 0.0001
+  stage4_epochs: 3
+  stage4_lr: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 1000
+  lr_schedule: warmup_cosine

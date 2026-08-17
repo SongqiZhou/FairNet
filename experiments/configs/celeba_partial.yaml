@@ -1,0 +1,7 @@
+# FairNet-Partial (Table 1, "partial / x"). The detector and the contrastive
+# LoRA see only `labeled_fraction` of the training sensitive labels, and no
+# validation sensitive labels are used for checkpoint selection.
+base: celeba_base
+variant: partial
+fairnet:
+  labeled_fraction: 0.10

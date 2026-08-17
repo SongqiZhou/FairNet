@@ -11,3 +11,5 @@ dist/
 *.ckpt
 .ipynb_checkpoints/
 data/
+# Experiment run records produced by experiments/run_experiment.py
+results/

@@ -1,0 +1,10 @@
+# Table 3 "w/o contrastive loss": the LoRA matrices are trained with the plain
+# task loss on flagged instances instead of Equation 2.
+base: celeba_partial
+fairnet:
+  stage4_objective: task
+  # Section 5.4 says the ablation replaces the contrastive loss with "binary
+  # cross entropy loss on flagged instances", i.e. plain BCE. Class-balancing it
+  # would turn the ablation into a strong method in its own right rather than a
+  # weaker baseline rather than a method in its own right.
+  class_balanced_stage4_task: false
